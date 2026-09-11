@@ -17,8 +17,9 @@ import (
 // snapshots which source was primary when it ran, so tests can prove Drop
 // executes before source.SetPrimary swaps in the new track.
 type recordingOutput struct {
-	mu    sync.Mutex
-	calls []string
+	mu      sync.Mutex
+	calls   []string
+	volumes []float32
 
 	// source is the SwitchingAudioSource manageLoop passed as the reader when
 	// creating this output; captured by the newOutput hook.
@@ -58,9 +59,14 @@ func (o *recordingOutput) Drop() error {
 }
 
 func (o *recordingOutput) DelayMs() (int64, error) { return 0, nil }
-func (o *recordingOutput) SetVolume(float32)       {}
-func (o *recordingOutput) Error() <-chan error     { return make(chan error) }
-func (o *recordingOutput) Close() error            { o.record("Close"); return nil }
+func (o *recordingOutput) SetVolume(v float32) {
+	o.mu.Lock()
+	o.volumes = append(o.volumes, v)
+	o.calls = append(o.calls, "Volume")
+	o.mu.Unlock()
+}
+func (o *recordingOutput) Error() <-chan error { return make(chan error) }
+func (o *recordingOutput) Close() error        { o.record("Close"); return nil }
 
 // snapshot returns a copy of the recorded calls so far, safe to inspect
 // without racing the manage loop.
@@ -358,5 +364,24 @@ func TestCommandsAfterCloseDoNotPanic(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("commands issued after close blocked forever")
+	}
+}
+
+// PulseAudio restores a previous sink-input volume when opening an output.
+// A volume command received while stopped must override that before sound.
+func TestVolumeChosenBeforeOutputOpenIsAppliedBeforeResume(t *testing.T) {
+	out := &recordingOutput{}
+	p := newTestPlayer(t, out)
+	p.SetVolume(MaxStateVolume / 5)
+	if err := p.SetPrimaryStream(rampSource(100, 0, 0), false, false); err != nil {
+		t.Fatal(err)
+	}
+	out.mu.Lock()
+	defer out.mu.Unlock()
+	if len(out.volumes) != 1 || out.volumes[0] < 0.199 || out.volumes[0] > 0.201 {
+		t.Fatalf("requested 20%% before play, output got %v", out.volumes)
+	}
+	if slices.Index(out.calls, "Volume") > slices.Index(out.calls, "Resume") {
+		t.Fatalf("volume applied after audio started: %v", out.calls)
 	}
 }

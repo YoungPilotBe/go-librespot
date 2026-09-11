@@ -14,6 +14,7 @@ import (
 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
 	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
 	"github.com/devgianlu/go-librespot/tracks"
+	"google.golang.org/protobuf/proto"
 )
 
 type State struct {
@@ -234,8 +235,8 @@ func (p *AppPlayer) initState() {
 // statePutMinInterval is the minimum spacing between connect-state PUTs.
 const statePutMinInterval = 200 * time.Millisecond
 
-// updateState PUTs the latest connect-state, at most one per statePutMinInterval: immediately
-// and synchronously when the budget allows, else deferred to the timer so a burst coalesces.
+// updateState submits the latest connect-state at most once per interval.
+// The network writer serializes delivery and coalesces snapshots during stalls.
 func (p *AppPlayer) updateState(ctx context.Context) {
 	p.stateDirty = true
 	if p.statePutScheduled {
@@ -257,9 +258,6 @@ func contextMetadata(fromCommand, fromResolver map[string]string) map[string]str
 }
 
 func (p *AppPlayer) putConnectState(ctx context.Context, reason connectpb.PutStateReason) error {
-	if reason == connectpb.PutStateReason_BECAME_INACTIVE {
-		return p.sess.Spclient().PutConnectStateInactive(ctx, p.spotConnId, false)
-	}
 
 	putStateReq := &connectpb.PutStateRequest{
 		ClientSideTimestamp: uint64(time.Now().UnixMilli()),
@@ -285,17 +283,29 @@ func (p *AppPlayer) putConnectState(ctx context.Context, reason connectpb.PutSta
 		putStateReq.LastCommandSentByDeviceId = p.state.lastCommand.SentByDeviceId
 	}
 
-	// finally send the state update
-	cluster, err := p.sess.Spclient().PutConnectState(ctx, p.spotConnId, putStateReq)
-	if err != nil {
-		return err
+	// Freeze all protobuf maps/pointers before crossing the goroutine boundary.
+	job := stateWrite{connectionID: p.spotConnId,
+		request:  proto.Clone(putStateReq).(*connectpb.PutStateRequest),
+		inactive: reason == connectpb.PutStateReason_BECAME_INACTIVE}
+	if reason == connectpb.PutStateReason_NEW_DEVICE {
+		job.reply = make(chan stateWriteResult, 1)
 	}
-
-	if device := cluster.Device[p.app.deviceId]; device != nil && device.PublicIp != "" {
-		p.state.device.PublicIp = device.PublicIp
+	p.stateWriter.submit(job)
+	if job.reply == nil {
+		return nil
 	}
-
-	return nil
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case result := <-job.reply:
+		if result.err != nil {
+			return result.err
+		}
+		if device := result.cluster.GetDevice()[p.app.deviceId]; device != nil && device.PublicIp != "" {
+			p.state.device.PublicIp = device.PublicIp
+		}
+		return nil
+	}
 }
 
 // coverImageSizes maps the ProvidedTrack metadata keys Spotify's clients look

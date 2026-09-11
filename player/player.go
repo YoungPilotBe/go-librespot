@@ -247,6 +247,7 @@ func (p *Player) manageLoop() {
 
 	// initial volume is 1
 	volume := float32(1)
+	volumeChosen := false
 
 	// whether the output is paused, so seek knows whether to resume after Drop
 	paused := false
@@ -279,6 +280,12 @@ loop:
 						break
 					}
 
+					// PulseAudio can restore a stale sink-input level on open.
+					// Reassert an explicit command received before output existed,
+					// before Resume can make the first sample audible.
+					if volumeChosen {
+						out.SetVolume(volume)
+					}
 					outErr = out.Error()
 					p.log.Debugf("created new output device")
 				}
@@ -380,6 +387,7 @@ loop:
 					cmd.resp <- pos
 				}
 			case playerCmdVolume:
+				volumeChosen = true
 				volume = cmd.data.(float32)
 				if out != nil {
 					out.SetVolume(volume)
@@ -597,7 +605,7 @@ func (p *Player) SetSecondaryStream(source librespot.AudioSource) {
 	<-resp
 }
 
-func (p *Player) httpChunkedReaderFromStorageResolve(log librespot.Logger, client *http.Client, storageResolve *downloadpb.StorageResolveResponse) (*audio.HttpChunkedReader, error) {
+func (p *Player) httpChunkedReaderFromStorageResolve(ctx context.Context, log librespot.Logger, client *http.Client, storageResolve *downloadpb.StorageResolveResponse) (*audio.HttpChunkedReader, error) {
 	if storageResolve.Result == downloadpb.StorageResolveResponse_STORAGE {
 		return nil, fmt.Errorf("old storage not supported")
 	} else if storageResolve.Result == downloadpb.StorageResolveResponse_RESTRICTED {
@@ -628,7 +636,11 @@ func (p *Player) httpChunkedReaderFromStorageResolve(log librespot.Logger, clien
 			}
 
 			var rawStream *audio.HttpChunkedReader
-			rawStream, err = audio.NewHttpChunkedReader(log, client, cdnUrl.String())
+			// A stalled CDN must yield to the next advertised endpoint promptly.
+			// Only construction is bounded; ongoing playback owns its own context.
+			startup, cancel := context.WithTimeout(ctx, 3*time.Second)
+			rawStream, err = audio.NewHttpChunkedReaderContext(startup, log, client, cdnUrl.String())
+			cancel()
 			if err != nil {
 				log.WithError(err).WithField("host", cdnUrl.Host).Warnf("failed creating chunked reader, trying next url")
 				p.cdnQuarantine[cdnUrl.Host] = time.Now()
@@ -736,6 +748,21 @@ func (p *Player) getUnrestrictedTrack(ctx context.Context, spotId librespot.Spot
 
 func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId librespot.SpotifyId, bitrate int, mediaPosition int64) (*Stream, error) {
 	log := p.log.WithField("uri", spotId.Uri())
+	started := time.Now()
+	var metadataDone, keyDone, storageDone time.Time
+	defer func() {
+		if time.Since(started) < time.Second {
+			return
+		}
+		elapsed := func(at time.Time) int64 {
+			if at.IsZero() {
+				return -1
+			}
+			return at.Sub(started).Milliseconds()
+		}
+		log.Debugf("stream setup timing: metadata=%dms key=%dms storage=%dms total=%dms",
+			elapsed(metadataDone), elapsed(keyDone), elapsed(storageDone), time.Since(started).Milliseconds())
+	}()
 
 	// Remember the id the caller asked for: spotId is reassigned below when a
 	// restricted track is relinked to an alternative.
@@ -815,11 +842,13 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 
 	log.Debugf("selected format %s (%x)", file.Format.String(), file.FileId)
 
+	metadataDone = time.Now()
 	audioKey, err := p.retrieveAudioKey(ctx, spotId, file.FileId)
 	if err != nil {
 		return nil, fmt.Errorf("failed retrieving audio key: %w", err)
 	}
 
+	keyDone = time.Now()
 	p.events.PostStreamRequestAudioKey(playbackId)
 
 	// Prefer a cached copy of the encrypted audio file when available: this
@@ -852,9 +881,10 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 			return nil, fmt.Errorf("failed resolving track storage: %w", err)
 		}
 
+		storageDone = time.Now()
 		p.events.PostStreamResolveStorage(playbackId)
 
-		httpStream, err := p.httpChunkedReaderFromStorageResolve(log, client, storageResolve)
+		httpStream, err := p.httpChunkedReaderFromStorageResolve(ctx, log, client, storageResolve)
 		if err != nil {
 			return nil, fmt.Errorf("failed creating chunked reader: %w", err)
 		}

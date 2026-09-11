@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -26,7 +25,6 @@ import (
 	"github.com/devgianlu/go-librespot/player"
 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
 	"github.com/devgianlu/go-librespot/session"
-	"github.com/devgianlu/go-librespot/spclient"
 	"github.com/devgianlu/go-librespot/tracks"
 )
 
@@ -45,6 +43,7 @@ type AppPlayer struct {
 	initialVolumeOnce sync.Once
 	volumeUpdate      chan float32
 
+	stateWriter       *stateWriter
 	stateTimer        *time.Timer
 	stateDirty        bool
 	statePutScheduled bool
@@ -811,6 +810,14 @@ func (p *AppPlayer) Close() {
 }
 
 func (p *AppPlayer) Run(apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaPlayer2PlayerCommand) {
+	p.stateWriter = newStateWriter(p.ctx, p.app.log, func(ctx context.Context, job stateWrite) (*connectpb.Cluster, error) {
+		if job.inactive {
+			return nil, p.sess.Spclient().PutConnectStateInactive(ctx, job.connectionID, false)
+		}
+		return p.sess.Spclient().PutConnectState(ctx, job.connectionID, job.request)
+	})
+	defer func() { p.cancel(); <-p.stateWriter.done }()
+
 	err := p.sess.Dealer().Connect(p.ctx)
 	if err != nil {
 		p.app.log.WithError(err).Error("failed connecting to dealer")
@@ -959,20 +966,10 @@ func (p *AppPlayer) Run(apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaP
 	}
 }
 
-// flushState PUTs the latest connect-state and records the send time. On a rate-limit it
-// schedules a coalesced resend after the cooldown. Runs on the Run goroutine.
+// flushState submits the newest snapshot without putting Spotify network latency
+// on the command loop. The writer owns retries and rate-limit cooldowns.
 func (p *AppPlayer) flushState(ctx context.Context) {
 	p.stateDirty = false
 	p.lastStatePut = time.Now()
-	if err := p.putConnectState(ctx, connectpb.PutStateReason_PLAYER_STATE_CHANGED); err != nil {
-		p.app.log.WithError(err).Error("failed put state after update")
-
-		// Rate-limited: resend the latest state after the cooldown instead of dropping it.
-		var rl *spclient.RateLimitedError
-		if errors.As(err, &rl) {
-			p.stateDirty = true
-			p.statePutScheduled = true
-			p.stateTimer.Reset(rl.RetryAfter)
-		}
-	}
+	_ = p.putConnectState(ctx, connectpb.PutStateReason_PLAYER_STATE_CHANGED)
 }

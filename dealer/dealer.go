@@ -183,6 +183,30 @@ loop:
 }
 
 func (d *Dealer) recvLoop() {
+	// Reading and dispatching have different latency requirements. Keep pongs
+	// flowing while the player resolves media or waits for a state PUT. One
+	// ordered worker preserves command/message order without unbounded goroutines.
+	ctx, cancel := context.WithCancel(d.ctx)
+	pending := make(chan RawMessage, 64)
+	dispatched := make(chan struct{})
+	go func() {
+		defer close(dispatched)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg := <-pending:
+				if ctx.Err() != nil {
+					return
+				}
+				if msg.Type == "message" {
+					d.handleMessage(ctx, &msg)
+				} else {
+					d.handleRequest(ctx, &msg)
+				}
+			}
+		}
+	}()
 loop:
 	for {
 		select {
@@ -217,12 +241,15 @@ loop:
 			}
 
 			switch message.Type {
-			case "message":
-				d.handleMessage(&message)
-				break
-			case "request":
-				d.handleRequest(&message)
-				break
+			case "message", "request":
+				select {
+				case pending <- message:
+				default:
+					// A stalled consumer may not grow memory without bound or
+					// silently lose commands. Reconnect for a fresh session view.
+					d.log.Error("dealer dispatch queue full; reconnecting")
+					break loop
+				}
 			case "ping":
 				// we never receive ping messages
 				break
@@ -237,6 +264,11 @@ loop:
 			}
 		}
 	}
+
+	// Cancel blocked delivery/reply waits before reconnecting. Nothing from the
+	// old connection may be dispatched or acknowledged on the replacement.
+	cancel()
+	<-dispatched
 
 	// always close as we might end up here because of application errors
 	d.closeConn(websocket.StatusInternalError)
@@ -274,7 +306,7 @@ loop:
 	d.log.Debugf("dealer recv loop stopped")
 }
 
-func (d *Dealer) sendReply(key string, success bool) error {
+func (d *Dealer) sendReply(parent context.Context, key string, success bool) error {
 	reply := Reply{Type: "reply", Key: key}
 	reply.Payload.Success = success
 
@@ -283,7 +315,7 @@ func (d *Dealer) sendReply(key string, success bool) error {
 		return fmt.Errorf("failed marshalling reply: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(d.ctx, timeout)
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	_, err = d.writeConn(ctx, websocket.MessageText, replyBytes)
 	cancel()
 	if err != nil {

@@ -81,8 +81,17 @@ type HttpChunkedReader struct {
 	latencies []time.Duration
 }
 
-func NewHttpChunkedReader(log librespot.Logger, client *http.Client, audioUrl string) (_ *HttpChunkedReader, err error) {
+func NewHttpChunkedReader(log librespot.Logger, client *http.Client, audioUrl string) (*HttpChunkedReader, error) {
+	return NewHttpChunkedReaderContext(context.Background(), log, client, audioUrl)
+}
+
+// NewHttpChunkedReaderContext bounds startup, including reading the first body.
+// After startup the stream owns its lifetime: cancelling a completed play command
+// must not cut off the next chunk of a track that is already playing.
+func NewHttpChunkedReaderContext(startup context.Context, log librespot.Logger, client *http.Client, audioUrl string) (_ *HttpChunkedReader, err error) {
 	ctx, cancel := context.WithCancel(context.Background())
+	stopStartup := context.AfterFunc(startup, cancel)
+	defer stopStartup()
 	r := &HttpChunkedReader{
 		log:    log,
 		client: client,
@@ -131,6 +140,9 @@ func NewHttpChunkedReader(log librespot.Logger, client *http.Client, audioUrl st
 	// The first chunk is fetched eagerly here, so count it towards completion.
 	r.completedChunks = 1
 
+	if !stopStartup() && startup.Err() != nil {
+		return nil, startup.Err()
+	}
 	log.Debugf("fetched first chunk of %d, total size is %d bytes", len(r.chunks), r.len)
 	return r, nil
 }

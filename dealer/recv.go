@@ -3,6 +3,7 @@ package dealer
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -131,7 +132,7 @@ func handleTransferEncoding(headers map[string]string, data []byte) ([]byte, err
 	return data, nil
 }
 
-func (d *Dealer) handleMessage(rawMsg *RawMessage) {
+func (d *Dealer) handleMessage(ctx context.Context, rawMsg *RawMessage) {
 	//goland:noinspection GoImportUsedAsName
 	log := d.log.WithField("uri", rawMsg.Uri)
 
@@ -189,7 +190,11 @@ func (d *Dealer) handleMessage(rawMsg *RawMessage) {
 	}
 
 	for _, recv := range matchedReceivers {
-		recv.c <- msg
+		select {
+		case recv.c <- msg:
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
@@ -218,7 +223,7 @@ func (d *Dealer) ReceiveMessage(uriPrefixes ...string) <-chan Message {
 	return c
 }
 
-func (d *Dealer) handleRequest(rawMsg *RawMessage) {
+func (d *Dealer) handleRequest(ctx context.Context, rawMsg *RawMessage) {
 	//goland:noinspection GoImportUsedAsName
 	log := d.log.WithField("uri", rawMsg.MessageIdent)
 
@@ -259,18 +264,18 @@ func (d *Dealer) handleRequest(rawMsg *RawMessage) {
 		MessageIdent: rawMsg.MessageIdent,
 		Payload:      payload,
 	}:
-	case <-d.done:
+	case <-ctx.Done():
 		return
 	}
 
 	// wait for response and send it
 	select {
 	case success := <-resp:
-		if err := d.sendReply(rawMsg.Key, success); err != nil {
+		if err := d.sendReply(ctx, rawMsg.Key, success); err != nil {
 			log.WithError(err).Error("failed sending dealer reply")
 			return
 		}
-	case <-d.done:
+	case <-ctx.Done():
 		return
 	}
 }
