@@ -38,13 +38,23 @@ func TestSlowPlayerDoesNotBlockDealerPong(t *testing.T) {
 			defer server.CloseNow()
 			d := NewDealer(&librespot.NullLogger{}, http.DefaultClient, nil, nil)
 			d.conn = conn
-			defer func() { server.CloseNow(); d.Close() }()
+			recvDone := make(chan struct{})
+			defer func() {
+				closed := make(chan struct{})
+				go func() { d.Close(); close(closed) }()
+				// Mark the dealer as shutting down before closing its peer;
+				// otherwise the reader legitimately attempts reconnection.
+				<-d.done
+				server.CloseNow()
+				<-closed
+				<-recvDone
+			}()
 			// Register an intentionally busy consumer before starting the reader.
 			d.messageReceivers = []messageReceiver{{uriPrefixes: []string{"hm://test/"}, c: make(chan Message)}}
 			before := time.Now().Add(-time.Second)
 			d.lastPong = before
 			d.requestReceivers["test"] = requestReceiver{c: make(chan Request, 1)}
-			go d.recvLoop()
+			go func() { d.recvLoop(); close(recvDone) }()
 			raw := RawMessage{Type: kind, Uri: "hm://test/busy", MessageIdent: "test", Key: "request-key"}
 			raw.Payload.Compressed = []byte(`{"command":{"endpoint":"play"}}`)
 			wire, err := json.Marshal(raw)
